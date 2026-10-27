@@ -1,0 +1,40 @@
+name: Daily 7 AM Email Digest
+
+on:
+  schedule:
+    # 1:30 AM UTC = 7:00 AM IST (Indian Standard Time)
+    - cron: '30 1 * * *'
+  # Allows you to click "Run workflow" anytime to test manually
+  workflow_dispatch:
+
+jobs:
+  run-digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install python-dotenv
+
+      - name: Run Email Assistant
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_1_EMAIL: ${{ secrets.GMAIL_1_EMAIL }}
+          GMAIL_1_PASSWORD: ${{ secrets.GMAIL_1_PASSWORD }}
+          GMAIL_1_LABEL: ${{ secrets.GMAIL_1_LABEL }}
+          GMAIL_2_EMAIL: ${{ secrets.GMAIL_2_EMAIL }}
+          GMAIL_2_PASSWORD: ${{ secrets.GMAIL_2_PASSWORD }}
+          GMAIL_2_LABEL: ${{ secrets.GMAIL_2_LABEL }}
+          GMAIL_3_EMAIL: ${{ secrets.GMAIL_3_EMAIL }}
+          GMAIL_3_PASSWORD: ${{ secrets.GMAIL_3_PASSWORD }}
+          GMAIL_3_LABEL: ${{ secrets.GMAIL_3_LABEL }}
+        run: python digest.py
