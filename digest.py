@@ -6,6 +6,7 @@ import json
 import email
 import imaplib
 import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta
 from email.header import decode_header
 from dotenv import load_dotenv
@@ -66,6 +67,20 @@ def clean_body_text(payload):
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return " ".join(lines)[:2500]
 
+def extract_relevant_urls(raw_text):
+    urls = re.findall(r'https?://[^\s<>"\'\)]+', raw_text)
+    clean = []
+    ignore_keywords = [
+        'unsubscribe', 'optout', 'privacy', 'terms', 'facebook', 'twitter', 
+        'instagram', 'youtube', 'linkedin.com/help', 'support', 'pixel', 'logo'
+    ]
+    for u in urls:
+        u_lower = u.lower()
+        if not any(k in u_lower for k in ignore_keywords) and len(u) > 15:
+            if u not in clean:
+                clean.append(u)
+    return clean[:4]
+
 def fetch_recent_emails(email_address, password, hours=24):
     emails_data = []
     try:
@@ -88,33 +103,45 @@ def fetch_recent_emails(email_address, password, hours=24):
                 res, data = mail.fetch(msg_id, "(RFC822)")
                 if res != "OK":
                     continue
-                raw_email = data[0][1]
-                msg = email.message_from_bytes(raw_email)
+                msg = email.message_from_bytes(data[0][1])
 
                 subject = decode_mime_words(msg.get("Subject", "No Subject"))
                 from_ = decode_mime_words(msg.get("From", "Unknown Sender"))
                 date_str = msg.get("Date", "")
+                message_id_header = msg.get("Message-ID", "").strip("<> ")
+
+                gmail_link = ""
+                if message_id_header:
+                    gmail_link = f"https://mail.google.com/mail/#search/rfc822msgid%3A{urllib.parse.quote(message_id_header)}"
 
                 body_snippet = ""
+                all_text_for_urls = ""
                 if msg.is_multipart():
                     for part in msg.walk():
                         content_type = part.get_content_type()
                         content_disposition = str(part.get("Content-Disposition"))
-                        if content_type == "text/plain" and "attachment" not in content_disposition:
+                        if content_type in ["text/plain", "text/html"] and "attachment" not in content_disposition:
                             payload = part.get_payload(decode=True)
                             if payload:
-                                body_snippet = clean_body_text(payload)
-                                break
+                                text_str = clean_body_text(payload)
+                                all_text_for_urls += " " + text_str
+                                if not body_snippet and content_type == "text/plain":
+                                    body_snippet = text_str
                 else:
                     payload = msg.get_payload(decode=True)
                     if payload:
                         body_snippet = clean_body_text(payload)
+                        all_text_for_urls = body_snippet
+
+                links = extract_relevant_urls(all_text_for_urls)
 
                 emails_data.append({
                     "from": from_,
                     "subject": subject,
                     "date": date_str,
-                    "snippet": body_snippet
+                    "snippet": body_snippet[:1500],
+                    "job_apply_link": links[0] if links else "",
+                    "gmail_link": gmail_link
                 })
             except Exception:
                 continue
@@ -155,37 +182,32 @@ def summarize_with_gemini(all_accounts_emails):
 You are Julia's personal email executive assistant. 
 Create an informative, comprehensive, and beautifully formatted email digest for Telegram.
 
-CRITICAL REQUIREMENT - STRICT SEPARATION BY ACCOUNT:
-DO NOT mix or blend emails from different accounts together!
-The input contains emails keyed by each specific account label.
-For EACH account, create its own distinct section header and list its emails underneath it.
-
-FORMATTING RULES:
+CRITICAL REQUIREMENT - STRICT SEPARATION BY ACCOUNT & CLEAN LINKS:
 1. NO MARKDOWN ASTERISKS (*) OR HASHES (#). Use HTML tags: <b>bold</b> and <i>italic</i>.
 2. Use the unicode bullet symbol "•" for list items.
 3. Clean up timestamps: write simple times like "(14:26 IST)".
 4. DO NOT SKIP ANY EMAILS.
-5. If an account has NO new emails for this period, write "• No new emails".
-6. Separate each account with a clear divider line: `─────────────────────`
+5. If an account has NO new emails for this period, write "• No new emails in this period".
+
+CRITICAL HYPERLINK RULES:
+- For job matches: If 'job_apply_link' is available, attach a clean, minimal hyperlink to the role title:
+  • <b>Role:</b> Job Title (<a href="URL">Apply ↗</a>)
+- For alerts: You may optionally add a clean (<a href="GMAIL_URL">Open ↗</a>) if gmail_link is present.
+- NEVER display raw, long URLs. ALWAYS use clean anchor text like `<a href="...">Apply ↗</a>` or `<a href="...">Open ↗</a>`.
 
 STRUCTURE TEMPLATE:
-📬 <b>[Account 1 Label & Email]</b>
+📬 <b>[Account Label & Email]</b>
 
 🎯 <b>Target QA & Python Job Matches</b>
 🔴 <b>Company Name</b> (14:26 IST)
-• <b>Role:</b> Job Title
+• <b>Role:</b> Job Title (<a href="URL">Apply ↗</a>)
 • <b>Details:</b> Drive date, location, remote status.
 
 🔴 <b>Important Alerts</b>
-• Full explanation.
+• Google Security: Full explanation (<a href="GMAIL_URL">Open ↗</a>).
 
 🟢 <b>Newsletters & Promos</b>
-• Topic.
-
-─────────────────────
-
-📬 <b>[Account 2 Label & Email]</b>
-• Details for account 2 (or '• No new emails in this period').
+• Topic description.
 
 Emails separated by account:
 {json.dumps(all_accounts_emails, indent=2)}
@@ -199,36 +221,26 @@ Emails separated by account:
     for label, emails in all_accounts_emails.items():
         fallback += f"📬 <b>{label}</b> ({len(emails)} emails):\n"
         if not emails:
-            fallback += "• No new emails\n\n"
+            fallback += "• No new emails in this period\n\n"
         else:
             for em in emails[:5]:
-                fallback += f"• <b>{em['subject']}</b> ({em['from']})\n"
+                link_part = f" (<a href='{em['job_apply_link']}'>Apply ↗</a>)" if em.get('job_apply_link') else ""
+                fallback += f"• <b>{em['subject']}</b>{link_part} ({em['from']})\n"
             fallback += "\n"
     return fallback
 
 def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "📅 Today", "callback_data": "range_today"},
-                {"text": "⏮️ Yesterday", "callback_data": "range_yesterday"},
-                {"text": "🗓️ Last 7 Days", "callback_data": "range_week"}
-            ]
-        ]
-    }
     chunk_size = 4000
     chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
 
-    for idx, chunk in enumerate(chunks):
+    for chunk in chunks:
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": chunk,
-            "parse_mode": "HTML"
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
         }
-        if idx == len(chunks) - 1:
-            payload["reply_markup"] = keyboard
-
         req_data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=req_data, headers={"Content-Type": "application/json"})
         try:

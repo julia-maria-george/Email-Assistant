@@ -7,6 +7,7 @@ import email
 import imaplib
 import threading
 import urllib.request
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from email.header import decode_header
@@ -26,6 +27,25 @@ MODELS_LIST = [
 ]
 
 ACTIVE_MESSAGES = {}
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Daily Email Assistant Bot is Running 24/7 on Render!")
+
+    def log_message(self, format, *args):
+        pass
+
+def start_health_check_server():
+    port = int(os.getenv("PORT", 10000))
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        print(f"Health-check HTTP server listening on port {port} for Render...")
+        server.serve_forever()
+    except Exception as e:
+        print(f"Health server info: {e}")
 
 def send_telegram_raw(chat_id, text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -95,7 +115,23 @@ def clean_body_text(payload):
     else:
         text = str(payload)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return " ".join(lines)[:2500]
+    return " ".join(lines)[:3000]
+
+def extract_relevant_urls(raw_text):
+    """Extract clean application/job URLs, ignoring tracking/unsubscribe links."""
+    urls = re.findall(r'https?://[^\s<>"\'\)]+', raw_text)
+    clean = []
+    ignore_keywords = [
+        'unsubscribe', 'optout', 'privacy', 'terms', 'facebook', 'twitter', 
+        'instagram', 'youtube', 'linkedin.com/help', 'support', 'pixel', 'logo',
+        'schemas.microsoft.com', 'w3.org'
+    ]
+    for u in urls:
+        u_lower = u.lower()
+        if not any(k in u_lower for k in ignore_keywords) and len(u) > 15:
+            if u not in clean:
+                clean.append(u)
+    return clean[:4]
 
 def fetch_emails_for_range(email_address, password, timeframe="today"):
     emails_data = []
@@ -135,27 +171,40 @@ def fetch_emails_for_range(email_address, password, timeframe="today"):
                 subject = decode_mime_words(msg.get("Subject", "No Subject"))
                 from_ = decode_mime_words(msg.get("From", "Unknown Sender"))
                 date_str = msg.get("Date", "")
+                message_id_header = msg.get("Message-ID", "").strip("<> ")
+
+                gmail_link = ""
+                if message_id_header:
+                    gmail_link = f"https://mail.google.com/mail/#search/rfc822msgid%3A{urllib.parse.quote(message_id_header)}"
 
                 body_snippet = ""
+                all_text_for_urls = ""
                 if msg.is_multipart():
                     for part in msg.walk():
                         content_type = part.get_content_type()
                         content_disposition = str(part.get("Content-Disposition"))
-                        if content_type == "text/plain" and "attachment" not in content_disposition:
+                        if content_type in ["text/plain", "text/html"] and "attachment" not in content_disposition:
                             payload = part.get_payload(decode=True)
                             if payload:
-                                body_snippet = clean_body_text(payload)
-                                break
+                                text_str = clean_body_text(payload)
+                                all_text_for_urls += " " + text_str
+                                if not body_snippet and content_type == "text/plain":
+                                    body_snippet = text_str
                 else:
                     payload = msg.get_payload(decode=True)
                     if payload:
                         body_snippet = clean_body_text(payload)
+                        all_text_for_urls = body_snippet
+
+                links = extract_relevant_urls(all_text_for_urls)
 
                 emails_data.append({
                     "from": from_,
                     "subject": subject,
                     "date": date_str,
-                    "snippet": body_snippet
+                    "snippet": body_snippet[:1500],
+                    "job_apply_link": links[0] if links else "",
+                    "gmail_link": gmail_link
                 })
             except Exception:
                 continue
@@ -196,26 +245,34 @@ def summarize_with_gemini(all_accounts_emails, timeframe_key):
 You are Julia's personal email executive assistant. 
 Create an informative, comprehensive, and beautifully formatted email digest for Telegram.
 
-CRITICAL FORMATTING INSTRUCTIONS:
+CRITICAL REQUIREMENT - STRICT SEPARATION BY ACCOUNT & CLEAN LINKS:
 1. NO MARKDOWN ASTERISKS (*) OR HASHES (#). Use HTML tags: <b>bold</b> and <i>italic</i>.
 2. Use the unicode bullet symbol "•" for list items.
 3. Clean up timestamps: write simple times like "(14:26 IST)".
 4. DO NOT SKIP ANY EMAILS.
 5. If an account has NO new emails for this period, write "• No new emails in this period".
 
-LAYOUT STYLE:
+CRITICAL HYPERLINK RULES:
+- For job matches: If 'job_apply_link' is available, attach a clean, minimal hyperlink to the role title or a tiny tag:
+  • <b>Role:</b> Job Title (<a href="URL">View / Apply ↗</a>)
+- For alerts: You may optionally add a clean (<a href="GMAIL_URL">Open ↗</a>) if gmail_link is present.
+- NEVER display raw, long URLs. ALWAYS use clean anchor text like `<a href="...">View / Apply ↗</a>` or `<a href="...">Open ↗</a>`. Keep it super clean without cluttering the description.
+
+STRUCTURE TEMPLATE:
+📬 <b>[Account Label & Email]</b>
+
 🎯 <b>Target QA & Python Job Matches</b>
 🔴 <b>Company Name</b> (14:26 IST)
-• <b>Role:</b> Job Title
+• <b>Role:</b> Job Title (<a href="URL">Apply ↗</a>)
 • <b>Details:</b> Drive date, location, remote status.
 
 🔴 <b>Important Alerts</b>
-• Full explanation.
+• Google Security: Full explanation (<a href="GMAIL_URL">Open ↗</a>).
 
 🟢 <b>Newsletters & Promos</b>
-• Topic.
+• Topic description.
 
-Emails to summarize ({timeframe_key}):
+Emails separated by account ({timeframe_key}):
 {json.dumps(all_accounts_emails, indent=2)}
 """
 
@@ -223,20 +280,20 @@ Emails to summarize ({timeframe_key}):
     if result:
         return result
 
-    fallback = "<b>Email Overview:</b>\n\n"
+    fallback = "<b>Email Overview by Account:</b>\n\n"
     for label, emails in all_accounts_emails.items():
         fallback += f"📬 <b>{label}</b> ({len(emails)} emails):\n"
         if not emails:
             fallback += "• No new emails in this period\n\n"
         else:
             for em in emails[:5]:
-                fallback += f"• <b>{em['subject']}</b> ({em['from']})\n"
+                link_part = f" (<a href='{em['job_apply_link']}'>Apply ↗</a>)" if em.get('job_apply_link') else ""
+                fallback += f"• <b>{em['subject']}</b>{link_part} ({em['from']})\n"
             fallback += "\n"
     return fallback
 
-# KEYBOARD BUILDERS
+# KEYBOARDS
 def get_account_keyboard():
-    """Step 1: Choose which email to check."""
     accounts = get_accounts()
     buttons = []
     for idx, acc in enumerate(accounts):
@@ -247,7 +304,6 @@ def get_account_keyboard():
     return {"inline_keyboard": buttons}
 
 def get_timeframe_keyboard(acc_target):
-    """Step 2: Choose timeframe for the selected email."""
     return {
         "inline_keyboard": [
             [
@@ -262,7 +318,6 @@ def get_timeframe_keyboard(acc_target):
     }
 
 def send_message_with_markup(chat_id, text, keyboard_markup):
-    """Send message with auto-delete of previous message after 1 min."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
     old_mids = ACTIVE_MESSAGES.get(chat_id, [])
@@ -277,7 +332,8 @@ def send_message_with_markup(chat_id, text, keyboard_markup):
         payload = {
             "chat_id": chat_id,
             "text": chunk,
-            "parse_mode": "HTML"
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
         }
         if idx == len(chunks) - 1 and keyboard_markup:
             payload["reply_markup"] = keyboard_markup
@@ -316,7 +372,6 @@ def answer_callback(callback_query_id, text):
         pass
 
 def show_accounts_menu(chat_id):
-    """Step 1 Prompt: Pick Email Account."""
     text = (
         "👋 <b>Hi Julia!</b>\n\n"
         "Which email account would you like to check?"
@@ -324,7 +379,6 @@ def show_accounts_menu(chat_id):
     send_message_with_markup(chat_id, text, get_account_keyboard())
 
 def show_timeframe_menu(chat_id, acc_target):
-    """Step 2 Prompt: Pick Timeframe for the selected Account."""
     accounts = get_accounts()
     if acc_target == "all":
         acc_name = "Both Accounts"
@@ -339,7 +393,6 @@ def show_timeframe_menu(chat_id, acc_target):
     send_message_with_markup(chat_id, text, get_timeframe_keyboard(acc_target))
 
 def execute_summary(chat_id, acc_target, timeframe_key):
-    """Fetch emails ONLY for the chosen account and display."""
     names = {
         "today": "Today",
         "yesterday": "Yesterday",
@@ -365,35 +418,14 @@ def execute_summary(chat_id, acc_target, timeframe_key):
 
     summary = summarize_with_gemini(all_data, timeframe_key)
     final_text = f"📊 <b>Email Digest — {header_title}</b>\n\n{summary}"
-    # Keep timeframe buttons + Back button attached
     send_message_with_markup(chat_id, final_text, get_timeframe_keyboard(acc_target))
-
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b"Daily Email Assistant Bot is Running 24/7!")
-
-    def log_message(self, format, *args):
-        pass
-
-def start_health_check_server():
-    port = int(os.getenv("PORT", 10000))
-    try:
-        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-        print(f"Health-check HTTP server listening on port {port} for Render...")
-        server.serve_forever()
-    except Exception as e:
-        print(f"Health server error (ignored for local use): {e}")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--menu":
         show_accounts_menu(TELEGRAM_CHAT_ID)
     else:
-        # Start health check server for Render free web service
         threading.Thread(target=start_health_check_server, daemon=True).start()
-        print(f"Bot listening with 2-step prompt flow for User ID: {TELEGRAM_CHAT_ID}...")
+        print(f"Bot listening with link extraction for User ID: {TELEGRAM_CHAT_ID}...")
         offset = 0
         while True:
             try:
@@ -404,52 +436,43 @@ if __name__ == "__main__":
                     for update in data.get("result", []):
                         offset = update["update_id"] + 1
 
-                        # BUTTON CLICKS
                         if "callback_query" in update:
                             cb = update["callback_query"]
                             cb_id = cb["id"]
                             data_key = cb.get("data", "")
                             from_id = cb["from"]["id"]
 
-                            # Security Lock
                             if from_id != TELEGRAM_CHAT_ID:
                                 answer_callback(cb_id, "⛔ Access Denied.")
                                 continue
 
-                            # Step 1: User chose to go back to accounts menu
                             if data_key == "menu_accounts":
                                 answer_callback(cb_id, "Returning to accounts...")
                                 show_accounts_menu(from_id)
 
-                            # Step 2: User picked an account
                             elif data_key.startswith("pick_acc_"):
                                 acc_target = data_key.replace("pick_acc_", "")
                                 answer_callback(cb_id, "Account selected!")
                                 show_timeframe_menu(from_id, acc_target)
 
-                            # Step 3: User picked timeframe for that account
                             elif data_key.startswith("run_"):
                                 parts = data_key.split("_")
-                                # Format: run_<acc_target>_<timeframe>
                                 acc_target = parts[1]
                                 timeframe = parts[2]
                                 answer_callback(cb_id, f"Fetching {timeframe}...")
                                 execute_summary(from_id, acc_target, timeframe)
 
-                        # USER SENDS MESSAGE ("hi", "/start", etc.)
                         elif "message" in update:
                             msg = update["message"]
                             chat_id = msg["chat"]["id"]
 
-                            # Security Lock
                             if chat_id != TELEGRAM_CHAT_ID:
                                 send_telegram_raw(chat_id, "⛔ Access Denied. Private assistant.")
                                 continue
 
-                            text = msg.get("text", "").strip().lower()
-                            # ANY greeting or command starts Step 1: Pick Email Account
                             show_accounts_menu(chat_id)
 
-            except Exception:
+            except Exception as e:
+                print(f"Polling loop notice: {e}")
                 import time
                 time.sleep(2)
