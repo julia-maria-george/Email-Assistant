@@ -9,7 +9,7 @@ import threading
 import urllib.request
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.header import decode_header
 from dotenv import load_dotenv
 
@@ -21,58 +21,12 @@ TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 MODELS_LIST = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-2.5-pro"
+    "gemini-3-flash-preview",
+    "gemini-3.8-flash",
+    "gemini-3.7-flash"
 ]
 
 ACTIVE_MESSAGES = {}
-
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b"Daily Email Assistant Bot is Running 24/7 on Render!")
-
-    def log_message(self, format, *args):
-        pass
-
-def start_health_check_server():
-    port = int(os.getenv("PORT", 10000))
-    try:
-        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-        print(f"Health-check HTTP server listening on port {port} for Render...")
-        server.serve_forever()
-    except Exception as e:
-        print(f"Health server info: {e}")
-
-def send_telegram_raw(chat_id, text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    req_data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=req_data, headers={"Content-Type": "application/json"})
-    try:
-        urllib.request.urlopen(req, timeout=10)
-    except Exception:
-        pass
-
-def delete_message(chat_id, message_id):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
-    payload = {"chat_id": chat_id, "message_id": message_id}
-    req_data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=req_data, headers={"Content-Type": "application/json"})
-    try:
-        urllib.request.urlopen(req, timeout=10)
-    except Exception:
-        pass
-
-def schedule_delete_after_delay(chat_id, message_ids, delay=60):
-    def _worker():
-        time.sleep(delay)
-        for mid in message_ids:
-            delete_message(chat_id, mid)
-    threading.Thread(target=_worker, daemon=True).start()
 
 def get_accounts():
     accounts_json = os.getenv("GMAIL_ACCOUNTS_JSON")
@@ -138,29 +92,32 @@ def fetch_emails_for_range(email_address, password, timeframe="today"):
     now = datetime.now()
 
     if timeframe == "today":
-        search_query = f'(SINCE "{now.strftime("%d-%b-%Y")}")'
+        since_date = now.strftime("%d-%b-%Y")
+        max_count = 35
     elif timeframe == "yesterday":
-        yesterday = now - timedelta(days=1)
-        search_query = f'(SINCE "{yesterday.strftime("%d-%b-%Y")}" BEFORE "{now.strftime("%d-%b-%Y")}")'
+        since_date = (now - timedelta(days=1)).strftime("%d-%b-%Y")
+        max_count = 50
     elif timeframe == "week":
-        week_ago = now - timedelta(days=7)
-        search_query = f'(SINCE "{week_ago.strftime("%d-%b-%Y")}")'
+        since_date = (now - timedelta(days=7)).strftime("%d-%b-%Y")
+        max_count = 80
     else:
-        search_query = f'(SINCE "{now.strftime("%d-%b-%Y")}")'
+        since_date = now.strftime("%d-%b-%Y")
+        max_count = 35
 
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(email_address, password)
         mail.select("INBOX", readonly=True)
 
-        status, messages = mail.search(None, search_query)
+        status, messages = mail.search(None, f'(SINCE "{since_date}")')
         if status != "OK" or not messages[0]:
             mail.logout()
             return emails_data
 
         message_ids = messages[0].split()
-        limit = 35 if timeframe == "week" else 25
-        message_ids = message_ids[-limit:]
+        message_ids = message_ids[-max_count:]
+
+        yesterday_date_str = (now - timedelta(days=1)).strftime("%d %b %Y")
 
         for msg_id in reversed(message_ids):
             try:
@@ -168,9 +125,13 @@ def fetch_emails_for_range(email_address, password, timeframe="today"):
                 if res != "OK":
                     continue
                 msg = email.message_from_bytes(data[0][1])
+
+                date_str = msg.get("Date", "")
+                if timeframe == "yesterday" and yesterday_date_str not in date_str:
+                    pass
+
                 subject = decode_mime_words(msg.get("Subject", "No Subject"))
                 from_ = decode_mime_words(msg.get("From", "Unknown Sender"))
-                date_str = msg.get("Date", "")
                 message_id_header = msg.get("Message-ID", "").strip("<> ")
 
                 gmail_link = ""
@@ -211,7 +172,7 @@ def fetch_emails_for_range(email_address, password, timeframe="today"):
 
         mail.logout()
     except Exception as e:
-        print(f"Error fetching for {email_address}: {e}")
+        print(f"Error accessing {email_address}: {e}")
 
     return emails_data
 
@@ -235,15 +196,15 @@ def call_gemini_with_retry(prompt):
                     raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
                     return format_clean_html(raw_text)
             except Exception as e:
-                print(f"Model {model_name} attempt {attempt+1} failed: {e}")
+                print(f"Model {model_name} attempt {attempt+1} note: {e}")
                 time.sleep(2)
 
     return None
 
-def summarize_with_gemini(all_accounts_emails, timeframe_key):
+def summarize_with_gemini(all_accounts_emails, timeframe_key="today"):
     prompt = f"""
 You are Julia's personal email executive assistant. 
-Create an informative, comprehensive, and beautifully formatted email digest for Telegram.
+Create an informative, comprehensive, and beautifully formatted email digest for Telegram for timeframe: '{timeframe_key}'.
 
 CRITICAL REQUIREMENT - STRICT SEPARATION BY ACCOUNT & CLEAN LINKS:
 1. NO MARKDOWN ASTERISKS (*) OR HASHES (#). Use HTML tags: <b>bold</b> and <i>italic</i>.
@@ -301,6 +262,7 @@ def get_account_keyboard():
         buttons.append([{"text": f"📬 {lbl} ({acc['email']})", "callback_data": f"pick_acc_{idx}"}])
     if len(accounts) > 1:
         buttons.append([{"text": "🌐 Check Both Accounts", "callback_data": "pick_acc_all"}])
+    buttons.append([{"text": "🌅 Run Full Daily Digest", "callback_data": "run_daily_digest"}])
     return {"inline_keyboard": buttons}
 
 def get_timeframe_keyboard(acc_target):
@@ -316,6 +278,33 @@ def get_timeframe_keyboard(acc_target):
             ]
         ]
     }
+
+def send_telegram_raw(chat_id, text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    req_data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=req_data, headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+
+def delete_message(chat_id, message_id):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
+    payload = {"chat_id": chat_id, "message_id": message_id}
+    req_data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=req_data, headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+
+def schedule_delete_after_delay(chat_id, message_ids, delay=60):
+    def _worker():
+        time.sleep(delay)
+        for mid in message_ids:
+            delete_message(chat_id, mid)
+    threading.Thread(target=_worker, daemon=True).start()
 
 def send_message_with_markup(chat_id, text, keyboard_markup):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -374,7 +363,7 @@ def answer_callback(callback_query_id, text):
 def show_accounts_menu(chat_id):
     text = (
         "👋 <b>Hi Julia!</b>\n\n"
-        "Which email account would you like to check?"
+        "Which email account would you like to check, or run the daily digest?"
     )
     send_message_with_markup(chat_id, text, get_account_keyboard())
 
@@ -420,59 +409,249 @@ def execute_summary(chat_id, acc_target, timeframe_key):
     final_text = f"📊 <b>Email Digest — {header_title}</b>\n\n{summary}"
     send_message_with_markup(chat_id, final_text, get_timeframe_keyboard(acc_target))
 
+def execute_daily_digest(chat_id=None):
+    target_chat_id = chat_id or TELEGRAM_CHAT_ID
+    accounts = get_accounts()
+    if not accounts:
+        send_telegram_raw(target_chat_id, "⚠️ No Gmail accounts configured.")
+        return
+
+    all_data = {}
+    for acc in accounts:
+        label = f"{acc.get('label', 'Account')} ({acc['email']})"
+        emails = fetch_emails_for_range(acc["email"], acc["password"], "today")
+        all_data[label] = emails
+
+    now_str = datetime.now().strftime("%A, %b %d")
+    summary = summarize_with_gemini(all_data, "today")
+    final_text = f"🌅 <b>Daily Briefing — {now_str}</b>\n\n{summary}"
+    send_message_with_markup(target_chat_id, final_text, get_account_keyboard())
+
+def process_update(update):
+    try:
+        if "callback_query" in update:
+            cb = update["callback_query"]
+            cb_id = cb["id"]
+            data_key = cb.get("data", "")
+            from_id = cb["from"]["id"]
+
+            if from_id != TELEGRAM_CHAT_ID:
+                answer_callback(cb_id, "⛔ Access Denied.")
+                return
+
+            if data_key == "menu_accounts":
+                answer_callback(cb_id, "Returning to accounts...")
+                show_accounts_menu(from_id)
+
+            elif data_key == "run_daily_digest":
+                answer_callback(cb_id, "🌅 Generating daily briefing...")
+                execute_daily_digest(from_id)
+
+            elif data_key.startswith("pick_acc_"):
+                acc_target = data_key.replace("pick_acc_", "")
+                answer_callback(cb_id, "Account selected!")
+                show_timeframe_menu(from_id, acc_target)
+
+            elif data_key.startswith("run_"):
+                parts = data_key.split("_")
+                acc_target = parts[1]
+                timeframe = parts[2]
+                answer_callback(cb_id, f"Fetching {timeframe}...")
+                execute_summary(from_id, acc_target, timeframe)
+
+        elif "message" in update:
+            msg = update["message"]
+            chat_id = msg["chat"]["id"]
+            text = (msg.get("text") or "").strip().lower()
+
+            if chat_id != TELEGRAM_CHAT_ID:
+                send_telegram_raw(chat_id, "⛔ Access Denied. Private assistant.")
+                return
+
+            if text in ["/digest", "digest", "/briefing", "briefing"]:
+                send_telegram_raw(chat_id, "🌅 Generating daily briefing...")
+                execute_daily_digest(chat_id)
+            else:
+                show_accounts_menu(chat_id)
+    except Exception as e:
+        print(f"Error processing update: {e}")
+
+class BotRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path in ["/cron_digest", "/digest"]:
+            threading.Thread(target=execute_daily_digest, args=(TELEGRAM_CHAT_ID,), daemon=True).start()
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"Daily digest triggered successfully!\n")
+            return
+
+        if path == "/set_webhook":
+            base_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEBHOOK_URL")
+            if base_url:
+                ok = register_webhook(base_url)
+                msg = f"Webhook registration: {'SUCCESS' if ok else 'FAILED'} -> {base_url}/webhook\n"
+            else:
+                msg = "No RENDER_EXTERNAL_URL or WEBHOOK_URL found in environment.\n"
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(msg.encode("utf-8"))
+            return
+
+        if path == "/keepalive":
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"Alive\n")
+            return
+
+        # Default root health check
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Daily Email Assistant Bot is Running 24/7 on Render!\n")
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path in ["/cron_digest", "/digest"]:
+            threading.Thread(target=execute_daily_digest, args=(TELEGRAM_CHAT_ID,), daemon=True).start()
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"Daily digest triggered successfully!\n")
+            return
+
+        if path == "/webhook":
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length)
+
+            # Instant 200 OK acknowledgment to prevent Telegram retry storms
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"ok": true}')
+
+            try:
+                update = json.loads(post_data.decode("utf-8"))
+                threading.Thread(target=process_update, args=(update,), daemon=True).start()
+            except Exception as e:
+                print(f"Webhook update processing note: {e}")
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        # Keep terminal log clean
+        pass
+
+def register_webhook(base_url):
+    webhook_url = f"{base_url.rstrip('/')}/webhook"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    payload = {
+        "url": webhook_url,
+        "drop_pending_updates": False,
+        "allowed_updates": ["message", "callback_query"]
+    }
+    req_data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=req_data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+            print(f"Telegram Webhook configured to: {webhook_url} -> {data.get('description', 'OK')}")
+            return data.get("ok", False)
+    except Exception as e:
+        print(f"Failed to register webhook: {e}")
+        return False
+
+def unregister_webhook():
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
+    payload = {"drop_pending_updates": False}
+    req_data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=req_data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+            print(f"Webhook removed (local polling active): {data.get('description', 'OK')}")
+            return True
+    except Exception as e:
+        print(f"Failed to remove webhook: {e}")
+        return False
+
+def start_daily_scheduler():
+    def _scheduler_loop():
+        print("Internal 7:00 AM IST Daily Digest Scheduler active...")
+        last_sent_date = None
+        while True:
+            try:
+                # Calculate IST (UTC + 5:30)
+                now_utc = datetime.now(timezone.utc)
+                now_ist = now_utc + timedelta(hours=5, minutes=30)
+                today_str = now_ist.strftime("%Y-%m-%d")
+
+                # If between 7:00 AM and 7:05 AM IST, trigger once daily
+                if now_ist.hour == 7 and now_ist.minute < 5:
+                    if last_sent_date != today_str:
+                        print(f"Triggering automated 7:00 AM IST Daily Digest for {today_str}...")
+                        last_sent_date = today_str
+                        execute_daily_digest(TELEGRAM_CHAT_ID)
+
+                time.sleep(30)
+            except Exception as e:
+                print(f"Scheduler tick error: {e}")
+                time.sleep(60)
+
+    threading.Thread(target=_scheduler_loop, daemon=True).start()
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--menu":
         show_accounts_menu(TELEGRAM_CHAT_ID)
     else:
-        threading.Thread(target=start_health_check_server, daemon=True).start()
-        print(f"Bot listening with link extraction for User ID: {TELEGRAM_CHAT_ID}...")
-        offset = 0
-        while True:
+        port = int(os.getenv("PORT", 10000))
+        webhook_base = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEBHOOK_URL")
+
+        # Start internal 7:00 AM IST scheduler thread
+        start_daily_scheduler()
+
+        if webhook_base:
+            print(f"🚀 Render environment detected ({webhook_base})! Activating Webhook mode on port {port}...")
+            register_webhook(webhook_base)
+            server = HTTPServer(("0.0.0.0", port), BotRequestHandler)
+            print(f"Webhook HTTP server listening on port {port}...")
             try:
-                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=20"
-                req = urllib.request.Request(url)
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read().decode())
-                    for update in data.get("result", []):
-                        offset = update["update_id"] + 1
+                server.serve_forever()
+            except KeyboardInterrupt:
+                pass
+        else:
+            print(f"💻 Local environment detected. Starting local polling loop & HTTP health server on port {port}...")
+            # Unregister any existing webhook so polling works locally
+            unregister_webhook()
 
-                        if "callback_query" in update:
-                            cb = update["callback_query"]
-                            cb_id = cb["id"]
-                            data_key = cb.get("data", "")
-                            from_id = cb["from"]["id"]
+            def run_server():
+                try:
+                    server = HTTPServer(("0.0.0.0", port), BotRequestHandler)
+                    server.serve_forever()
+                except Exception as e:
+                    print(f"Health server note: {e}")
+            threading.Thread(target=run_server, daemon=True).start()
 
-                            if from_id != TELEGRAM_CHAT_ID:
-                                answer_callback(cb_id, "⛔ Access Denied.")
-                                continue
-
-                            if data_key == "menu_accounts":
-                                answer_callback(cb_id, "Returning to accounts...")
-                                show_accounts_menu(from_id)
-
-                            elif data_key.startswith("pick_acc_"):
-                                acc_target = data_key.replace("pick_acc_", "")
-                                answer_callback(cb_id, "Account selected!")
-                                show_timeframe_menu(from_id, acc_target)
-
-                            elif data_key.startswith("run_"):
-                                parts = data_key.split("_")
-                                acc_target = parts[1]
-                                timeframe = parts[2]
-                                answer_callback(cb_id, f"Fetching {timeframe}...")
-                                execute_summary(from_id, acc_target, timeframe)
-
-                        elif "message" in update:
-                            msg = update["message"]
-                            chat_id = msg["chat"]["id"]
-
-                            if chat_id != TELEGRAM_CHAT_ID:
-                                send_telegram_raw(chat_id, "⛔ Access Denied. Private assistant.")
-                                continue
-
-                            show_accounts_menu(chat_id)
-
-            except Exception as e:
-                print(f"Polling loop notice: {e}")
-                import time
-                time.sleep(2)
+            print(f"Bot listening via Polling for User ID: {TELEGRAM_CHAT_ID}...")
+            offset = 0
+            while True:
+                try:
+                    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=20"
+                    req = urllib.request.Request(url)
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        data = json.loads(resp.read().decode())
+                        for update in data.get("result", []):
+                            offset = update["update_id"] + 1
+                            process_update(update)
+                except Exception as e:
+                    print(f"Polling loop notice: {e}")
+                    time.sleep(2)

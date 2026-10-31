@@ -19,9 +19,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 MODELS_LIST = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-2.5-pro"
+    "gemini-3-flash-preview",
+    "gemini-3.8-flash",
+    "gemini-3.7-flash"
 ]
 
 def get_accounts():
@@ -172,7 +172,7 @@ def call_gemini_with_retry(prompt):
                     raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
                     return format_clean_html(raw_text)
             except Exception as e:
-                print(f"Model {model_name} attempt {attempt+1} failed: {e}")
+                print(f"Model {model_name} attempt {attempt+1} note: {e}")
                 time.sleep(2)
 
     return None
@@ -217,6 +217,7 @@ Emails separated by account:
     if result:
         return result
 
+    print("Falling back to structured template summary...")
     fallback = "<b>Email Overview by Account:</b>\n\n"
     for label, emails in all_accounts_emails.items():
         fallback += f"📬 <b>{label}</b> ({len(emails)} emails):\n"
@@ -244,7 +245,10 @@ def send_telegram_message(text):
         req_data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=req_data, headers={"Content-Type": "application/json"})
         try:
-            urllib.request.urlopen(req, timeout=15)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                res = json.loads(resp.read().decode())
+                if not res.get("ok"):
+                    raise Exception(f"Telegram error: {res}")
         except Exception as e:
             print(f"HTML send failed ({e}), retrying as plain text...")
             clean_plain = re.sub(r'<[^>]+>', '', chunk)
@@ -252,22 +256,53 @@ def send_telegram_message(text):
             payload.pop("parse_mode", None)
             req_data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(url, data=req_data, headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=15)
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    res = json.loads(resp.read().decode())
+                    if not res.get("ok"):
+                        raise Exception(f"Telegram retry error: {res}")
+            except Exception as e2:
+                print(f"ERROR: Failed to send Telegram message: {e2}")
+                sys.exit(1)
 
 def main():
+    print("=" * 50)
+    print("Starting Daily Email Digest Job...")
+    print("Timestamp:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    print("=" * 50)
+
+    if not TELEGRAM_BOT_TOKEN:
+        print("ERROR: TELEGRAM_BOT_TOKEN is missing!")
+        sys.exit(1)
+    if not TELEGRAM_CHAT_ID:
+        print("ERROR: TELEGRAM_CHAT_ID is missing!")
+        sys.exit(1)
+    if not GEMINI_API_KEY:
+        print("ERROR: GEMINI_API_KEY is missing!")
+        sys.exit(1)
+
     accounts = get_accounts()
     if not accounts:
-        return
+        print("ERROR: No Gmail accounts found! Please configure GMAIL_1_EMAIL and GMAIL_1_PASSWORD.")
+        sys.exit(1)
+
+    print(f"Found {len(accounts)} configured Gmail account(s).")
     all_accounts_data = {}
     for acc in accounts:
         label = f"{acc.get('label', 'Account')} ({acc['email']})"
+        print(f"Fetching emails for {label}...")
         emails = fetch_recent_emails(acc["email"], acc["password"], hours=24)
+        print(f"-> Retrieved {len(emails)} emails.")
         all_accounts_data[label] = emails
 
     now_str = datetime.now().strftime("%A, %b %d")
+    print("Generating AI summary via Gemini...")
     summary = summarize_with_gemini(all_accounts_data)
     final_text = f"🌅 <b>Daily Briefing — {now_str}</b>\n\n{summary}"
+
+    print("Sending briefing to Telegram...")
     send_telegram_message(final_text)
+    print("Daily digest sent successfully!")
 
 if __name__ == "__main__":
     main()

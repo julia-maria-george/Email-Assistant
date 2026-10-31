@@ -2,9 +2,9 @@ name: Daily 7 AM Email Digest
 
 on:
   schedule:
-    # 1:30 AM UTC = 7:00 AM IST (Indian Standard Time)
-    - cron: '30 1 * * *'
-  # Allows you to click "Run workflow" anytime to test manually
+    # 1:33 AM UTC = 7:03 AM IST (offset by 3 minutes to bypass GitHub Actions peak-time traffic delays)
+    - cron: '33 1 * * *'
+  # Allows you to click "Run workflow" anytime to test manually from GitHub Actions UI
   workflow_dispatch:
 
 jobs:
